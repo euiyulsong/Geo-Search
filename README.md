@@ -1,570 +1,448 @@
-# 실제 OSM 기반 Geo Search Benchmark 결과
+# Elasticsearch Native vs H3 지역검색 실험 결과
 
-## 1. 실험 개요
+## 1. 실험 비교 대상
 
-실제 OpenStreetMap(OSM) POI 데이터를 이용해 지역 검색 방식별 성능을 비교했다.
+지역 기반 후보 검색 방식 3가지를 비교했다.
 
-### 데이터
+* **ES_NATIVE**
 
-* 전체 OSM feature: **24,423개**
-* 사용 가능한 POI: **24,412개**
+  * Elasticsearch의 native geo index 사용
+  * `geo_distance` / 거리 기반 검색
+  * 기준 정답 역할
+* **H3_INCREMENTAL**
 
-| Category   |  Count |
-| ---------- | -----: |
-| restaurant | 21,852 |
-| cafe       |  2,067 |
-| fast_food  |    485 |
-| food_court |      8 |
+  * H3 cell을 중심에서부터 ring 단위로 확장
+  * 필요한 후보 수를 확보하면 탐색 종료
+* **H3_ES_HYBRID**
 
-검색 기준점으로부터 POI 거리 분포는 다음과 같다.
+  * H3로 coarse candidate를 먼저 제한
+  * 이후 Elasticsearch geo 검색을 추가 적용
 
-| Metric | Distance |
-| ------ | -------: |
-| Min    |     14 m |
-| Median |  6.91 km |
-| P90    |  8.68 km |
-| P95    |  9.10 km |
-| P99    | 10.29 km |
-| Max    | 11.07 km |
+평가 지표:
 
-Elasticsearch에 총 **24,412개 문서**를 인덱싱했고, `Top-K=20` 기준으로 평가했다.
+* `p50 / p95 / p99 latency`
+* `Recall@1 / @5 / @20 / @100 / @500`
+* `candidate_recall`
+* 탐색 candidate 수
+* H3 ring 수
 
 ---
 
-# 2. 1차 Benchmark
+# 2. Overall
 
-비교 방식:
+| Method         |         p50 |         p95 | Recall@20 | Recall@500 | Candidate Recall |
+| -------------- | ----------: | ----------: | --------: | ---------: | ---------------: |
+| **ES_NATIVE**  | **1.88 ms** | **2.12 ms** | **1.000** |  **1.000** |                - |
+| H3_INCREMENTAL |     2.46 ms |     2.62 ms |     0.966 |      0.938 |            0.938 |
+| H3_ES_HYBRID   |     4.10 ms |     4.50 ms |     0.966 |      0.938 |            0.938 |
 
-* `ES_NATIVE`
+전체적으로 **ES Native가 latency와 recall 모두 가장 좋았다.**
+H3 Incremental은 Hybrid보다 빠르지만 ES Native보다 느리고, 전체 candidate recall도 약 **93.8%**에 그쳤다. Hybrid는 H3 후보생성 뒤 ES 작업까지 추가되면서 가장 느렸다.
 
-  * Elasticsearch native geo distance 검색
-* `H3_INCREMENTAL`
-
-  * H3 cell을 중심에서 ring 단위로 확장
-* `HYBRID_H3_ES`
-
-  * H3로 후보군을 제한한 뒤 Elasticsearch에서 검색/정렬
-
-## 결과
-
-| Method         |         P50 |         P95 |         P99 | Recall@20 | Candidates | Rings |
-| -------------- | ----------: | ----------: | ----------: | --------: | ---------: | ----: |
-| **ES_NATIVE**  | **4.33 ms** | **7.67 ms** | **9.51 ms** | **1.000** |          - |     - |
-| H3_INCREMENTAL |    10.54 ms |    14.27 ms |    23.29 ms |     1.000 |        382 |     1 |
-| HYBRID_H3_ES   |     6.71 ms |     9.38 ms |    16.08 ms |     1.000 |        382 |     1 |
-
-### 결과 해석
-
-세 방식 모두 `Recall@20 = 1.0`으로 검색 정확도 차이는 없었다.
-
-하지만 latency에서는:
+### 핵심
 
 ```text
-ES_NATIVE
-    ↓ 약 55% 느림
-HYBRID_H3_ES
-    ↓ 추가로 느림
-H3_INCREMENTAL
+ES Native
+→ 가장 빠름
+→ Recall 100%
+
+H3 Incremental
+→ ES보다 약간 느림
+→ Recall 약 94%
+
+Hybrid
+→ 가장 느림
+→ H3와 동일한 Recall
 ```
 
-순서가 명확했다.
+따라서 **Elasticsearch를 이미 사용하는 환경에서는 H3를 추가하는 실익이 크지 않았다.**
 
-특히 median latency 기준:
+---
+
+# 3. Top-K 크기에 따른 결과
+
+## K가 아주 작을 때는 H3가 빠름
+
+### K = 1
+
+| Method         |         p50 |  Recall@1 |
+| -------------- | ----------: | --------: |
+| ES_NATIVE      |     1.62 ms | **1.000** |
+| H3_INCREMENTAL | **0.77 ms** |     0.889 |
+| Hybrid         |     1.43 ms |     0.889 |
+
+H3 Incremental은 약 **2배 빠르지만 Recall@1이 88.9%**로 떨어졌다.
+
+### K = 5
 
 ```text
-ES Native       4.33 ms
-Hybrid          6.71 ms
-H3              10.54 ms
+ES Native        1.69 ms / Recall 1.000
+H3 Incremental   0.98 ms / Recall 0.887
+Hybrid           1.71 ms / Recall 0.887
 ```
 
-즉 현재 규모에서는 H3를 사용해서 후보를 382개까지 줄이는 것보다 Elasticsearch가 직접 geo index를 검색하는 것이 더 빨랐다.
+역시 H3가 latency 면에서는 빠르지만 약 11%의 candidate를 놓친다.
 
 ---
 
-# 3. Query Type별 Benchmark
-
-검색 질의를 실제 서비스에서 발생할 수 있는 형태로 나눴다.
-
-* `near_me`: 내 주변 음식점
-* `point_anchor`: 강남역/잠실역/홍대입구역 등 특정 지점
-* `landmark`: 롯데월드/코엑스
-* `explicit_radius`: 강남역 1km
-* `admin_area`: 송파구/강남구
-* `neighborhood`: 역삼동
-
----
-
-# 4. Near-me 검색
-
-### `내 주변 음식점`
-
-| Method                 |         P50 |         P95 | Recall@20 | Candidates | Queries |
-| ---------------------- | ----------: | ----------: | --------: | ---------: | ------: |
-| **ES_NATIVE_DISTANCE** | **2.73 ms** | **3.45 ms** |       1.0 |          - |   **1** |
-| H3_ES_HYBRID           |     4.92 ms |     5.74 ms |       1.0 |        356 |       3 |
-| H3_INCREMENTAL         |     6.65 ms |     8.27 ms |       1.0 |        356 |       2 |
-| ES_ADAPTIVE_RADIUS     |     7.67 ms |     9.06 ms |       1.0 |        200 |       2 |
-
-### 결론
-
-`near_me`에서도 Elasticsearch native distance search가 가장 좋았다.
-
-H3를 이용해 후보를 356개로 줄였지만, H3 계산 및 추가 query overhead 때문에 오히려 latency가 증가했다.
-
----
-
-# 5. 특정 지점(Point Anchor) 검색
-
-## 강남역 맛집
-
-| Method                 |         P50 |
-| ---------------------- | ----------: |
-| **ES_NATIVE_DISTANCE** | **1.99 ms** |
-| H3_ES_HYBRID           |     4.10 ms |
-| ES_ADAPTIVE_RADIUS     |     5.57 ms |
-| H3_INCREMENTAL         |     6.68 ms |
-
-H3는 **ring 1**만으로 356개의 후보를 확보했다.
-
----
-
-## 잠실역 맛집
-
-| Method                 |         P50 | Rings |
-| ---------------------- | ----------: | ----: |
-| **ES_NATIVE_DISTANCE** | **1.64 ms** |     - |
-| ES_ADAPTIVE_RADIUS     |     6.42 ms |     - |
-| H3_ES_HYBRID           |     7.31 ms |     4 |
-| H3_INCREMENTAL         |    10.06 ms |     4 |
-
-잠실에서는 주변 POI density가 낮아 H3가 **4 ring**까지 확장되어야 했다.
-
-결과적으로:
+## K = 20
 
 ```text
-H3 ring 증가
-→ H3 cell 증가
-→ Elasticsearch query 횟수 증가
-→ latency 증가
+ES Native        p50 1.88 ms / Recall@20 1.000
+H3 Incremental   p50 1.36 ms / Recall@20 0.906
+Hybrid           p50 2.27 ms / Recall@20 0.906
 ```
 
-현상이 확인됐다.
+H3 Incremental은 ES보다 약 0.5ms 빠르지만 **Top-20 Recall이 약 90.6%**로 감소한다.
+
+즉:
+
+> 작은 K에서는 H3 Incremental이 latency를 줄일 수 있지만, Recall 손실을 감수해야 한다.
 
 ---
 
-## 홍대입구역 카페
+# 4. K가 커지면 H3가 급격히 불리해짐
 
-| Method                 |         P50 | Rings |
-| ---------------------- | ----------: | ----: |
-| **ES_NATIVE_DISTANCE** | **1.60 ms** |     - |
-| H3_ES_HYBRID           |     5.83 ms |     3 |
-| ES_ADAPTIVE_RADIUS     |     6.75 ms |     - |
-| H3_INCREMENTAL         |     8.15 ms |     3 |
-
-역시 native geo query가 압도적으로 빠르다.
-
----
-
-# 6. Landmark 검색
-
-## 롯데월드 맛집
-
-| Method                 |         P50 | Rings |
-| ---------------------- | ----------: | ----: |
-| **ES_NATIVE_DISTANCE** | **1.66 ms** |     - |
-| H3_ES_HYBRID           |     6.58 ms |     4 |
-| ES_ADAPTIVE_RADIUS     |     6.64 ms |     - |
-| H3_INCREMENTAL         |     9.10 ms |     4 |
-
----
-
-## 코엑스 카페
-
-가장 H3에 불리한 케이스였다.
-
-| Method                 |         P50 |         P95 | Rings | Queries |
-| ---------------------- | ----------: | ----------: | ----: | ------: |
-| **ES_NATIVE_DISTANCE** | **1.61 ms** | **1.91 ms** |     - |       1 |
-| ES_ADAPTIVE_RADIUS     |     9.63 ms |    10.78 ms |     - |       5 |
-| H3_ES_HYBRID           |    13.19 ms |    15.00 ms |    10 |      12 |
-| H3_INCREMENTAL         |    16.72 ms |    18.18 ms |    10 |      11 |
-
-카페 density가 낮기 때문에 H3가 **10 ring**까지 확장됐다.
-
-이는 incremental H3 방식의 가장 큰 약점을 보여준다.
+### K = 100
 
 ```text
-Sparse region
-
-ring 1
-  ↓ 후보 부족
-ring 2
-  ↓
-ring 3
-  ↓
-...
-ring 10
-  ↓
-충분한 candidate 확보
+ES Native        2.65 ms
+H3 Incremental   4.05 ms
+Hybrid           6.11 ms
 ```
 
-반면 Elasticsearch native geo search는 POI density와 관계없이 **단일 query**로 약 1.6 ms에 결과를 반환했다.
+H3는 평균 11.5 ring까지 확장하고 약 108개 후보를 탐색한다. Recall@100은 약 92.3%다.
 
----
+### K = 500
 
-# 7. Explicit Radius 검색
+```text
+ES Native         6.50 ms
+H3 Incremental   24.93 ms
+Hybrid           31.70 ms
+```
 
-## `강남역 1km 맛집`
-
-| Method                 |         P50 | Recall |
-| ---------------------- | ----------: | -----: |
-| **ES_NATIVE_DISTANCE** | **1.46 ms** |    1.0 |
-| H3_ES_HYBRID           |     3.64 ms |    1.0 |
-| ES_ADAPTIVE_RADIUS     |     4.88 ms |    1.0 |
-| H3_INCREMENTAL         |     6.42 ms |    1.0 |
-
-명시적인 반경이 존재하는 경우에도 native geo query가 가장 빠르다.
+H3는 약 **28.5 ring**, 약 **515 candidates**까지 확장해야 하며 Recall@500은 **78.97%**까지 떨어진다.
 
 따라서:
 
 ```text
-"1km 이내 음식점"
-"500m 근처 카페"
-"3km 이내 주차장"
+K 작음
+→ H3가 latency 이점 가능
+
+K 큼
+→ ring 확장 비용 증가
+→ ES Native가 훨씬 우세
 ```
-
-같은 질의는 H3 ring expansion을 사용할 이유가 특히 적다.
-
-Elasticsearch의 `geo_distance` filter가 질의 의미와도 직접적으로 일치한다.
 
 ---
 
-# 8. 행정구역 검색
+# 5. 지역 Density별 결과
 
-행정구역 검색은 거리 검색이 아니라 polygon 기반으로 처리했다.
+## Dense 지역
 
-| Query  | Method            |         P50 |     P95 | Recall |
-| ------ | ----------------- | ----------: | ------: | -----: |
-| 송파구 맛집 | ES_NATIVE_POLYGON |     3.58 ms | 5.26 ms |    1.0 |
-| 강남구 카페 | ES_NATIVE_POLYGON |     2.74 ms | 3.09 ms |    1.0 |
-| 역삼동 맛집 | ES_NATIVE_POLYGON | **2.00 ms** | 2.43 ms |    1.0 |
+| Method         |         p50 |    Recall |
+| -------------- | ----------: | --------: |
+| ES_NATIVE      |     2.21 ms | **1.000** |
+| H3_INCREMENTAL | **1.52 ms** |     0.953 |
+| Hybrid         |     3.10 ms |     0.953 |
 
-행정구역 역시 Elasticsearch native polygon query만으로 충분히 빠른 성능을 보였다.
+Dense 지역에서는 H3 Incremental이 평균 **2 ring** 정도면 후보를 확보할 수 있어서 ES보다 빠르다.
 
-따라서 이런 질의:
+즉 강남역·홍대 같은 곳에서는:
 
 ```text
-송파구 맛집
-강남구 카페
-역삼동 음식점
+H3 ring 0
+→ ring 1
+→ ring 2
+→ 후보 충분
 ```
 
-은 H3가 아니라 **행정구역 polygon / geo_shape 검색**으로 처리하는 것이 자연스럽다.
+이 가능하기 때문에 H3의 장점이 가장 잘 나타난다.
 
 ---
 
-# 9. 전체 Query Type별 추천 방식
+## Medium 지역
 
-| Query Type      | Example    | Recommended                         |
-| --------------- | ---------- | ----------------------------------- |
-| Near-me         | 내 주변 음식점   | **ES geo_distance**                 |
-| Point Anchor    | 강남역 맛집     | **ES geo_distance**                 |
-| Landmark        | 롯데월드 맛집    | **ES geo_distance**                 |
-| Explicit Radius | 강남역 1km 맛집 | **ES geo_distance + radius filter** |
-| Admin Area      | 송파구 맛집     | **ES geo_shape / polygon**          |
-| Neighborhood    | 역삼동 맛집     | **ES geo_shape / polygon**          |
+```text
+ES Native       1.88 ms
+H3 Incremental  2.31 ms
+Hybrid          3.62 ms
+```
 
-이번 실험에서는 사실상 모든 질의 유형에서 Elasticsearch native geo functionality가 최선이었다.
+H3는 평균 5 ring이 필요해지면서 이미 ES Native보다 느려진다.
 
 ---
 
-# 10. H3가 느려진 이유
-
-H3 자체가 느려서라기보다 **검색 pipeline이 복잡해지기 때문**이다.
-
-## ES Native
+## Sparse 지역
 
 ```text
-query
-  ↓
-Elasticsearch spatial index
-  ↓
-Top-K
+ES Native       1.50 ms
+H3 Incremental  5.34 ms
+Hybrid          6.55 ms
 ```
 
-대부분 **1 query**면 끝난다.
+H3는 평균 **15.5 ring**까지 확장해야 해서 오히려 매우 비효율적이다.
 
-## H3 Incremental
+### 결론
 
 ```text
-query location
-  ↓
-H3 cell 계산
-  ↓
-ring 0 검색
-  ↓
-candidate 부족?
-  ↓
-ring 1
-  ↓
-candidate 부족?
-  ↓
-ring 2 ...
-  ↓
-distance 계산 / sorting
-  ↓
-Top-K
+Dense
+→ H3 Incremental 가능
+
+Medium
+→ ES Native 우세
+
+Sparse
+→ ES Native 압도적
 ```
 
-density가 낮을수록 이 overhead가 증가한다.
-
-실제 결과에서도:
-
-```text
-강남역
-rings = 1
-p50 = 6.68 ms
-
-잠실역
-rings = 4
-p50 = 10.06 ms
-
-코엑스
-rings = 10
-p50 = 16.72 ms
-```
-
-로 ring 수와 latency가 같이 증가하는 패턴이 나타났다.
+**H3의 incremental expansion은 density가 낮아질수록 탐색해야 하는 ring 수가 빠르게 증가한다.**
 
 ---
 
-# 11. Hybrid도 Native를 이기지 못한 이유
+# 6. Category 빈도별 결과
 
-Hybrid는 pure H3보다 일관되게 빨랐다.
-
-예:
+## Common category
 
 ```text
-강남역
-H3 incremental : 6.68 ms
-Hybrid         : 4.10 ms
-
-코엑스
-H3 incremental : 16.72 ms
-Hybrid         : 13.19 ms
+ES Native        2.05 ms
+H3 Incremental   2.07 ms
+Hybrid           3.45 ms
 ```
 
-즉 H3 candidate generation 이후 실제 ranking/search를 Elasticsearch에 맡기는 것은 개선 효과가 있다.
+거의 비슷한 latency지만 ES Native는 Recall 1.0, H3는 약 0.936이다.
 
-하지만 여전히:
-
-```text
-H3 candidate 생성
-+
-추가 ES query
-```
-
-라는 비용이 존재하기 때문에 native ES보다 느리다.
-
-```text
-ES Native     ≈ 1~3 ms
-Hybrid        ≈ 4~13 ms
-```
-
-이번 데이터에서는 candidate pruning으로 얻는 이득보다 candidate generation overhead가 더 컸다.
+즉 restaurant/cafe 같은 흔한 카테고리에서는 H3 candidate가 빠르게 확보돼 상대적으로 괜찮다.
 
 ---
 
-# 12. Adaptive Radius도 효과가 없었던 이유
-
-Adaptive radius 방식은 후보 수를 약 **200개**로 안정적으로 제한한다.
-
-하지만 native distance query보다 더 느렸다.
-
-예:
+## Medium frequency
 
 ```text
-강남역
-
-Native
-1 query
-1.99 ms
-
-Adaptive Radius
-2 queries
-5.57 ms
+ES Native        1.46 ms
+H3 Incremental   5.04 ms
+Hybrid           6.30 ms
 ```
 
-코엑스처럼 sparse한 영역에서는:
-
-```text
-5 queries
-9.63 ms
-```
-
-까지 증가한다.
-
-즉 **candidate count 감소보다 반복 query 비용이 더 컸다.**
+H3는 약 13.5 ring을 탐색한다.
 
 ---
 
-# 13. 가장 중요한 관찰
-
-## ① Candidate 수가 작다고 반드시 빠르지 않다
-
-H3:
+## Rare category
 
 ```text
-24,412 docs
-   ↓
-356 candidates
+ES Native        1.41 ms
+H3 Incremental   6.30 ms
+Hybrid           7.50 ms
 ```
 
-로 검색 공간을 크게 줄였음에도 native ES보다 느렸다.
+평균 16 ring까지 확장해야 한다.
 
-Elasticsearch의 geo index가 이미 공간 검색을 효율적으로 수행하기 때문에, application layer에서 수동으로 candidate를 줄이는 것이 반드시 이득이 아니다.
+따라서:
+
+```text
+음식점 / 카페
+→ H3가 어느 정도 경쟁 가능
+
+희귀한 POI
+→ H3 expansion 비효율
+→ ES Native가 유리
+```
 
 ---
 
-## ② Query 횟수가 latency에 매우 중요하다
+# 7. 명시적 Radius 검색
 
-결과에서 가장 명확한 패턴이다.
+이 결과가 가장 명확하다.
+
+## 100m
 
 ```text
-ES native
-1 query
-≈ 1~3 ms
-
-H3
-2~11 queries
-≈ 6~17 ms
+ES Native        1.33 ms
+H3 Incremental   1.23 ms
+Hybrid           2.15 ms
 ```
 
-즉 현재 규모에서는 **candidate count보다 round trip / query execution 횟수가 더 중요한 병목**이었다.
+거의 차이가 없고 모두 Recall 1.0이다.
+
+## 300m
+
+```text
+ES Native        1.43 ms
+H3 Incremental   1.40 ms
+Hybrid           2.50 ms
+```
+
+역시 거의 동일하다.
+
+## 1km
+
+```text
+ES Native        1.49 ms
+H3 Incremental   2.79 ms
+Hybrid           4.37 ms
+```
+
+1km부터는 ES Native가 명확히 더 빠르다.
+
+## 3km
+
+```text
+ES Native         2.04 ms
+H3 Incremental    8.64 ms
+Hybrid           11.97 ms
+```
+
+H3는 평균 16 ring이 필요하다.
+
+## 10km
+
+```text
+ES Native         3.87 ms
+H3 Incremental   52.86 ms
+Hybrid           60.49 ms
+```
+
+H3는 평균 **51 ring**까지 확장된다.
+
+따라서 명시적 radius query는:
+
+> **그냥 Elasticsearch native `geo_distance`를 쓰는 것이 압도적으로 좋다.**
 
 ---
 
-## ③ H3 Incremental은 density sensitivity가 크다
+# 8. 최종 결론
 
-Dense area:
+## ES Native가 기본 선택
 
-```text
-강남역
-ring = 1
-```
-
-Sparse area:
-
-```text
-코엑스 카페
-ring = 10
-```
-
-같은 알고리즘인데 데이터 density에 따라 latency가 크게 달라진다.
-
-따라서 tail latency 측면에서도 불리하다.
-
----
-
-## ④ Elasticsearch native search는 density에 비교적 안정적이다
-
-Native 결과:
-
-```text
-강남역      1.99 ms
-잠실역      1.64 ms
-홍대입구역   1.60 ms
-롯데월드     1.66 ms
-코엑스      1.61 ms
-```
-
-POI density가 크게 달라져도 latency 변화가 매우 작다.
-
-서비스 운영 관점에서는 이게 상당히 중요한 장점이다.
-
----
-
-# 14. 최종 결론
-
-이번 실제 OSM 24K POI 실험에서는:
-
-> **Elasticsearch native geo query가 가장 단순하면서도 가장 빠르고 정확했다.**
-
-모든 방식의 `Recall@20`은 1.0이었으므로 품질 차이는 없었으며, 성능은 대체로:
+전체적으로:
 
 ```text
 ES Native
-    >
-H3 + ES Hybrid
-    >
-Adaptive Radius
-    >
-H3 Incremental
+- 가장 안정적인 latency
+- Recall 100%
+- density 영향 작음
+- category rarity 영향 작음
+- radius가 커져도 비교적 안정적
 ```
 
-순이었다.
-
-따라서 현재 실험 결과만 놓고 보면 검색 architecture는 굳이 H3 기반으로 만들 필요가 없다.
+따라서 Elasticsearch를 이미 사용한다면:
 
 ```text
-Query Understanding
-        │
-        ├── "내 주변 / 강남역 / 롯데월드"
-        │        ↓
-        │   ES geo_distance
-        │
-        ├── "1km 이내"
-        │        ↓
-        │   ES geo_distance + radius
-        │
-        └── "송파구 / 역삼동"
-                 ↓
-            ES geo_shape
+geo_point
++ geo_distance
++ geo_shape
 ```
 
-정도가 가장 단순하고 합리적이다.
+를 기본 geo retrieval로 사용하는 것이 가장 합리적이다.
 
 ---
 
-# 15. 단, H3가 불필요하다는 뜻은 아님
+## H3 Incremental이 유리할 수 있는 경우
 
-이번 실험으로 말할 수 있는 것은 정확히:
-
-> **24K 규모의 단일 Elasticsearch index에서 Top-K 지역 검색을 하기 위해 application-level H3 ring expansion을 추가하는 것은 이점이 없었다.**
-
-이다.
-
-H3가 유리할 가능성이 있는 상황은 별도로 존재한다.
-
-예를 들어:
-
-* 수천만~수억 POI
-* Elasticsearch 외부에서 spatial sharding이 필요한 경우
-* cell별 pre-aggregation
-* 지역별 cache key
-* distributed routing
-* 실시간 heatmap
-* 공간 단위 batch processing
-* offline feature aggregation
-
-등에서는 H3 자체의 장점이 있을 수 있다.
-
-즉 H3의 주요 역할을:
+H3가 의미가 있는 조건은 상당히 제한적이었다.
 
 ```text
-Top-K geo search accelerator
+Dense area
+AND
+Common category
+AND
+Small Top-K
+AND
+Very local search
 ```
 
-로 보는 것보다는
+예:
 
 ```text
-Spatial partitioning / aggregation / routing
+강남역 주변 음식점 Top 5
+내 주변 카페 Top 10
 ```
 
-으로 보는 것이 이번 결과와 더 잘 맞는다.
+이런 경우:
+
+```text
+H3 center
+→ ring 1~2
+→ 바로 후보 확보
+```
+
+가 가능해서 latency를 줄일 수 있다.
+
+하지만 그 경우에도 **Recall 손실**이 존재했다.
 
 ---
 
-# 한 줄 결론
+## Hybrid는 현재 실험에서는 불필요
 
-> **실제 OSM 데이터 기준으로 `내 주변`, `강남역`, `랜드마크`, `1km`, `행정구역` 모두 Elasticsearch native geo search가 가장 빨랐으며, H3 ring expansion은 candidate 수는 줄였지만 반복 query와 ring expansion overhead 때문에 오히려 느려졌다.**
+H3 + Elasticsearch Hybrid는:
+
+```text
+H3 candidate 생성 비용
++
+ES geo query 비용
+```
+
+이 모두 발생하면서 대부분 가장 느렸다.
+
+그리고 Recall도 H3 candidate generation에 의해 제한되므로:
+
+```text
+Hybrid Recall
+≈ H3 Recall
+```
+
+이었다.
+
+따라서 현재 형태의 Hybrid는:
+
+> **ES Native에 비해 latency도 나쁘고 Recall도 낮으므로 사용할 이유가 거의 없다.**
+
+---
+
+# 9. Query Type별 추천
+
+| Query type          | 예시             | 추천                  |
+| ------------------- | -------------- | ------------------- |
+| Explicit radius     | `1km 내 맛집`     | **ES geo_distance** |
+| 주변 검색               | `내 주변 음식점`     | **ES Native 기본**    |
+| Dense + Top-K 매우 작음 | `강남역 카페 Top 5` | H3 실험 가능            |
+| Sparse 지역           | `시골역 주변 맛집`    | **ES Native**       |
+| Rare category       | `내 주변 특정 시설`   | **ES Native**       |
+| 큰 radius            | `10km 내 병원`    | **ES Native**       |
+| 행정구역                | `송파구 맛집`       | **ES geo_shape**    |
+
+---
+
+# 10. 핵심 Takeaway
+
+이번 실험에서 가장 중요한 결과는:
+
+> **Elasticsearch의 native BKD 기반 geo search가 생각보다 매우 강하다.**
+
+H3를 별도로 붙이면 항상 빨라질 것 같지만 실제로는:
+
+```text
+candidate가 가까이에 많이 존재
+→ H3가 빠를 수 있음
+
+candidate가 희소하거나
+K/radius가 커짐
+→ ring expansion 비용 폭증
+→ ES Native가 더 빠름
+```
+
+이라는 결과가 나왔다.
+
+따라서 production 설계는:
+
+```text
+Default
+→ Elasticsearch native geo search
+
+Optional optimization
+→ dense + common category + small-K에 대해서만
+   H3 routing 여부 추가 실험
+```
+
+정도가 가장 합리적이다.
